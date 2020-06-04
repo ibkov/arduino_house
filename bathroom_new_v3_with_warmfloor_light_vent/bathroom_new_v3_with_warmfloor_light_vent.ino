@@ -1,5 +1,6 @@
 
 #include <WiFi.h>
+#include <PubSubClient.h>
 #include "DHT.h"
 
 const char* ssid = "nov8-52";
