@@ -1,6 +1,5 @@
 
 #include <WiFi.h>
-#include <PubSubClient.h>
 #include "DHT.h"
 
 const char* ssid = "nov8-52";
@@ -9,8 +8,8 @@ const char* mqtt_server = "192.168.14.7";
 const char led = 13;
 
 /* define DHT pins */
-#define DHTPIN 27
-#define DHTTYPE DHT22
+#define DHTPIN 21
+#define DHTTYPE DHT11
 DHT dht(DHTPIN, DHTTYPE);
 
 /* system variables */
@@ -38,8 +37,8 @@ WiFiClient espClient;
 PubSubClient client(espClient);
 
 /* topics */
-#define TEMP_TOPIC    "bathroom/temp"
-#define HUM_TOPIC    "bathroom/hum"
+#define TEMP_TOPIC    "bathroom/temperature"
+#define HUM_TOPIC    "bathroom/humidity"
 #define LED_TOPIC     "smarthome/room1/led" /* 1=on, 0=off */
 #define VENTILATION_TOPIC  "bathroom/ventilation" /* 1=on, 0=off */
 #define VENTILATION_TOPIC_STATUS  "bathroom/ventilation/status" /* 1=on, 0=off */
@@ -228,11 +227,13 @@ void loop() {
   ventilation_switch();
   light_switch();
   warm_floor();
-  if (now - lastMsg > 3000) {
+  if (now - lastMsg > 10000) {
     lastMsg = now;
     /* read DHT11/DHT22 sensor and convert to string */
     temperature = dht.readTemperature();
     humidity = dht.readHumidity();
+    Serial.println(temperature);
+    Serial.println(humidity);
 
 
     if (!isnan(temperature)) {
@@ -242,7 +243,7 @@ void loop() {
       client.publish(HUM_TOPIC, msg);
     }
     else {
-      client.publish(TEMP_TOPIC, "NO");
+      client.publish(TEMP_TOPIC, "-100");
     }
   }
 }
