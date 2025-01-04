@@ -37,6 +37,8 @@ DHT dht(DHTPIN, DHTTYPE);
 bool lightState = false;
 bool ventState = false;
 bool floorState = false;
+bool lastSwitchLightState = false; // Последнее состояние выключателя света
+bool lastSwitchVentState = false;  // Последнее состояние выключателя вентиляции
 unsigned long lastDHTUpdate = 0;
 
 // Function prototypes
@@ -91,6 +93,7 @@ void handleMQTTMessage(char* topic, byte* payload, unsigned int length) {
   for (int i = 0; i < length; i++) {
     message += (char)payload[i];
   }
+
   if (String(topic) == LIGHT_TOPIC) {
     lightState = (message == "on");
     digitalWrite(LIGHT_PIN, lightState ? LOW : HIGH);
@@ -99,24 +102,24 @@ void handleMQTTMessage(char* topic, byte* payload, unsigned int length) {
     ventState = (message == "on");
     digitalWrite(VENTILATION_PIN, ventState ? HIGH : LOW);
     client.publish(VENTILATION_STATUS_TOPIC, ventState ? "on" : "off");
-  } else if (String(topic) == WARM_FLOOR_TOPIC) {
-    floorState = (message == "on");
-    digitalWrite(WARM_FLOOR_PIN, floorState ? HIGH : LOW);
-    client.publish(WARM_FLOOR_STATUS_TOPIC, floorState ? "on" : "off");
   }
 }
 
 void handleManualSwitches() {
-  bool currentLightState = digitalRead(SWITCH_LIGHT) == HIGH;
-  if (currentLightState != lightState) {
-    lightState = currentLightState;
+  // Чтение состояния выключателя света
+  bool switchLightState = digitalRead(SWITCH_LIGHT) == HIGH;
+  if (switchLightState != lastSwitchLightState) {
+    lastSwitchLightState = switchLightState;
+    lightState = !lightState; // Переключение состояния света
     digitalWrite(LIGHT_PIN, lightState ? LOW : HIGH);
     client.publish(LIGHT_STATUS_TOPIC, lightState ? "on" : "off");
   }
 
-  bool currentVentState = digitalRead(SWITCH_VENT) == HIGH;
-  if (currentVentState != ventState) {
-    ventState = currentVentState;
+  // Чтение состояния выключателя вентиляции
+  bool switchVentState = digitalRead(SWITCH_VENT) == HIGH;
+  if (switchVentState != lastSwitchVentState) {
+    lastSwitchVentState = switchVentState;
+    ventState = !ventState; // Переключение состояния вентиляции
     digitalWrite(VENTILATION_PIN, ventState ? HIGH : LOW);
     client.publish(VENTILATION_STATUS_TOPIC, ventState ? "on" : "off");
   }
