@@ -1,3 +1,4 @@
+
 #include <WiFi.h>
 #include <PubSubClient.h>
 #include <ArduinoOTA.h>
@@ -144,7 +145,10 @@ void handleManualSwitches() {
   bool switchVentState = digitalRead(SWITCH_VENT) == HIGH;
   if (switchVentState != lastSwitchVentState) {
     lastSwitchVentState = switchVentState;
-    ventState = !ventState; // Переключение состояния вентиляции
+    if (switchVentState)
+      ventState = true; // Переключение состояния вентиляции
+    else
+      ventState = false;
     digitalWrite(VENTILATION_PIN, ventState ? HIGH : LOW);
     client.publish(VENTILATION_STATUS_TOPIC, ventState ? "on" : "off");
   }
@@ -234,4 +238,7 @@ void loop() {
   handleManualSwitches();
   publishDHTData();
 }
+
+
+
 
