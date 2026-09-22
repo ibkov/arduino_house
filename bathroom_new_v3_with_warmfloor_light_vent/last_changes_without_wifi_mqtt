@@ -1,0 +1,996 @@
+#include <WiFi.h>
+#include <PubSubClient.h>
+#include <ArduinoOTA.h>
+#include "DHT.h"
+
+// =====================================================
+// WIFI / MQTT
+// =====================================================
+
+const char* ssid = "nov8-52-1";
+const char* password = "dfsDSvrdsw52";
+
+const char* mqtt_server = "192.168.14.7";
+const uint16_t mqtt_port = 1883;
+
+// =====================================================
+// GPIO
+// =====================================================
+
+#define DHTPIN 21
+#define DHTTYPE DHT11
+
+#define LED_INDICATOR 2
+
+#define VENTILATION_PIN 5
+#define WARM_FLOOR_PIN 18
+#define LIGHT_PIN 19
+
+#define SWITCH_LIGHT 35
+#define SWITCH_VENT 34
+
+// =====================================================
+// MQTT TOPICS
+// =====================================================
+
+#define TEMP_TOPIC "bathroom/temperature"
+#define HUM_TOPIC "bathroom/humidity"
+
+#define LIGHT_TOPIC "bathroom/light"
+#define LIGHT_STATUS_TOPIC "bathroom/light/status"
+
+#define VENTILATION_TOPIC "bathroom/ventilation"
+#define VENTILATION_STATUS_TOPIC "bathroom/ventilation/status"
+
+#define WARM_FLOOR_TOPIC "bathroom/warm_floor"
+#define WARM_FLOOR_STATUS_TOPIC "bathroom/warm_floor/status"
+
+// =====================================================
+// OBJECTS
+// =====================================================
+
+WiFiClient espClient;
+PubSubClient client(espClient);
+DHT dht(DHTPIN, DHTTYPE);
+
+// =====================================================
+// STATES
+// =====================================================
+
+volatile bool lightState = false;
+volatile bool ventState = false;
+volatile bool floorState = false;
+
+// Нужно ли отправить обновлённое состояние MQTT
+volatile bool lightStatusDirty = true;
+volatile bool ventStatusDirty = true;
+volatile bool floorStatusDirty = true;
+
+// Защита общих переменных между двумя ядрами ESP32
+portMUX_TYPE stateMux = portMUX_INITIALIZER_UNLOCKED;
+
+// =====================================================
+// PHYSICAL SWITCHES
+// =====================================================
+
+bool rawLightSwitch = false;
+bool stableLightSwitch = false;
+
+bool rawVentSwitch = false;
+bool stableVentSwitch = false;
+
+unsigned long lightSwitchChangeTime = 0;
+unsigned long ventSwitchChangeTime = 0;
+
+// 20 мс достаточно для подавления дребезга
+// и практически не ощущается человеком
+const unsigned long DEBOUNCE_TIME = 20;
+
+// =====================================================
+// TRIPLE TOGGLE
+// =====================================================
+
+unsigned long lastToggleTime = 0;
+int toggleCount = 0;
+
+const unsigned long TOGGLE_WINDOW = 700;
+
+// =====================================================
+// NETWORK TIMERS
+// =====================================================
+
+unsigned long lastWiFiAttempt = 0;
+unsigned long lastMQTTAttempt = 0;
+
+const unsigned long WIFI_RETRY_INTERVAL = 10000;
+const unsigned long MQTT_RETRY_INTERVAL = 5000;
+
+bool wifiWasConnected = false;
+bool otaStarted = false;
+
+// =====================================================
+// DHT
+// =====================================================
+
+unsigned long lastDHTUpdate = 0;
+const unsigned long DHT_INTERVAL = 10000;
+
+// =====================================================
+// OUTPUT CONTROL
+//
+// Здесь MQTT вообще не вызывается.
+// Поэтому физический выключатель НИКОГДА
+// не ждёт сервер.
+// =====================================================
+
+void setLightState(bool state) {
+
+  digitalWrite(
+    LIGHT_PIN,
+    state ? LOW : HIGH
+  );
+
+  portENTER_CRITICAL(&stateMux);
+
+  lightState = state;
+  lightStatusDirty = true;
+
+  portEXIT_CRITICAL(&stateMux);
+}
+
+
+void toggleLightState() {
+
+  bool newState;
+
+  portENTER_CRITICAL(&stateMux);
+
+  lightState = !lightState;
+  newState = lightState;
+
+  lightStatusDirty = true;
+
+  portEXIT_CRITICAL(&stateMux);
+
+  digitalWrite(
+    LIGHT_PIN,
+    newState ? LOW : HIGH
+  );
+}
+
+
+void setVentState(bool state) {
+
+  digitalWrite(
+    VENTILATION_PIN,
+    state ? HIGH : LOW
+  );
+
+  portENTER_CRITICAL(&stateMux);
+
+  ventState = state;
+  ventStatusDirty = true;
+
+  portEXIT_CRITICAL(&stateMux);
+}
+
+
+void toggleVentState() {
+
+  bool newState;
+
+  portENTER_CRITICAL(&stateMux);
+
+  ventState = !ventState;
+  newState = ventState;
+
+  ventStatusDirty = true;
+
+  portEXIT_CRITICAL(&stateMux);
+
+  digitalWrite(
+    VENTILATION_PIN,
+    newState ? HIGH : LOW
+  );
+}
+
+
+void setFloorState(bool state) {
+
+  digitalWrite(
+    WARM_FLOOR_PIN,
+    state ? HIGH : LOW
+  );
+
+  portENTER_CRITICAL(&stateMux);
+
+  floorState = state;
+  floorStatusDirty = true;
+
+  portEXIT_CRITICAL(&stateMux);
+}
+
+// =====================================================
+// PHYSICAL SWITCHES
+//
+// ЭТА ФУНКЦИЯ РАБОТАЕТ НА ОСНОВНОМ ЯДРЕ.
+//
+// НИКАКОГО:
+// WiFi
+// MQTT
+// DHT
+// OTA
+//
+// Поэтому свет реагирует практически мгновенно.
+// =====================================================
+
+void handleManualSwitches() {
+
+  unsigned long now = millis();
+
+  // ===================================================
+  // LIGHT
+  // ===================================================
+
+  bool currentRawLight =
+    digitalRead(SWITCH_LIGHT) == HIGH;
+
+  if (currentRawLight != rawLightSwitch) {
+
+    rawLightSwitch = currentRawLight;
+    lightSwitchChangeTime = now;
+  }
+
+  if (
+    now - lightSwitchChangeTime >= DEBOUNCE_TIME &&
+    stableLightSwitch != rawLightSwitch
+  ) {
+
+    stableLightSwitch = rawLightSwitch;
+
+    // Любой щелчок физического выключателя
+    // меняет текущее состояние света.
+    toggleLightState();
+
+    // =============================================
+    // Triple toggle
+    // =============================================
+
+    if (
+      now - lastToggleTime <= TOGGLE_WINDOW
+    ) {
+
+      toggleCount++;
+
+    } else {
+
+      toggleCount = 1;
+    }
+
+    lastToggleTime = now;
+
+    if (toggleCount >= 3) {
+
+      toggleVentState();
+
+      toggleCount = 0;
+    }
+  }
+
+  // ===================================================
+  // VENTILATION
+  // ===================================================
+
+  bool currentRawVent =
+    digitalRead(SWITCH_VENT) == HIGH;
+
+  if (currentRawVent != rawVentSwitch) {
+
+    rawVentSwitch = currentRawVent;
+    ventSwitchChangeTime = now;
+  }
+
+  if (
+    now - ventSwitchChangeTime >= DEBOUNCE_TIME &&
+    stableVentSwitch != rawVentSwitch
+  ) {
+
+    stableVentSwitch = rawVentSwitch;
+
+    // Вентиляция напрямую соответствует
+    // положению физического выключателя.
+    setVentState(stableVentSwitch);
+  }
+}
+
+// =====================================================
+// MQTT CALLBACK
+//
+// Выполняется на СЕТЕВОМ ядре.
+// =====================================================
+
+void handleMQTTMessage(
+  char* topic,
+  byte* payload,
+  unsigned int length
+) {
+
+  String message;
+
+  for (
+    unsigned int i = 0;
+    i < length;
+    i++
+  ) {
+
+    message += (char)payload[i];
+  }
+
+  message.trim();
+  message.toLowerCase();
+
+  Serial.print("MQTT: ");
+  Serial.print(topic);
+  Serial.print(" -> ");
+  Serial.println(message);
+
+  // ===================================================
+  // LIGHT
+  // ===================================================
+
+  if (
+    String(topic) == LIGHT_TOPIC
+  ) {
+
+    if (message == "on") {
+
+      setLightState(true);
+    }
+
+    else if (message == "off") {
+
+      setLightState(false);
+    }
+  }
+
+  // ===================================================
+  // VENTILATION
+  // ===================================================
+
+  else if (
+    String(topic) == VENTILATION_TOPIC
+  ) {
+
+    if (message == "on") {
+
+      setVentState(true);
+    }
+
+    else if (message == "off") {
+
+      setVentState(false);
+    }
+  }
+
+  // ===================================================
+  // WARM FLOOR
+  // ===================================================
+
+  else if (
+    String(topic) == WARM_FLOOR_TOPIC
+  ) {
+
+    if (message == "on") {
+
+      setFloorState(true);
+    }
+
+    else if (message == "off") {
+
+      setFloorState(false);
+    }
+  }
+}
+
+// =====================================================
+// MQTT STATUS
+//
+// Только сетевое ядро вызывает client.publish()
+// =====================================================
+
+void publishDirtyStates() {
+
+  bool publishLight;
+  bool publishVent;
+  bool publishFloor;
+
+  bool light;
+  bool vent;
+  bool floor;
+
+  portENTER_CRITICAL(&stateMux);
+
+  publishLight = lightStatusDirty;
+  publishVent = ventStatusDirty;
+  publishFloor = floorStatusDirty;
+
+  light = lightState;
+  vent = ventState;
+  floor = floorState;
+
+  lightStatusDirty = false;
+  ventStatusDirty = false;
+  floorStatusDirty = false;
+
+  portEXIT_CRITICAL(&stateMux);
+
+  // ===================================================
+  // LIGHT
+  // ===================================================
+
+  if (publishLight) {
+
+    if (
+      !client.publish(
+        LIGHT_STATUS_TOPIC,
+        light ? "on" : "off",
+        true
+      )
+    ) {
+
+      portENTER_CRITICAL(&stateMux);
+      lightStatusDirty = true;
+      portEXIT_CRITICAL(&stateMux);
+    }
+  }
+
+  // ===================================================
+  // VENT
+  // ===================================================
+
+  if (publishVent) {
+
+    if (
+      !client.publish(
+        VENTILATION_STATUS_TOPIC,
+        vent ? "on" : "off",
+        true
+      )
+    ) {
+
+      portENTER_CRITICAL(&stateMux);
+      ventStatusDirty = true;
+      portEXIT_CRITICAL(&stateMux);
+    }
+  }
+
+  // ===================================================
+  // FLOOR
+  // ===================================================
+
+  if (publishFloor) {
+
+    if (
+      !client.publish(
+        WARM_FLOOR_STATUS_TOPIC,
+        floor ? "on" : "off",
+        true
+      )
+    ) {
+
+      portENTER_CRITICAL(&stateMux);
+      floorStatusDirty = true;
+      portEXIT_CRITICAL(&stateMux);
+    }
+  }
+}
+
+// =====================================================
+// DHT
+//
+// Тоже выполняется на сетевом ядре.
+// Даже если DHT зависнет на чтении,
+// свет этого не заметит.
+// =====================================================
+
+void handleDHT() {
+
+  unsigned long now =
+    millis();
+
+  if (
+    now - lastDHTUpdate <
+    DHT_INTERVAL
+  ) {
+
+    return;
+  }
+
+  lastDHTUpdate = now;
+
+  float temperature =
+    dht.readTemperature();
+
+  float humidity =
+    dht.readHumidity();
+
+  Serial.print("Temperature: ");
+  Serial.println(temperature);
+
+  Serial.print("Humidity: ");
+  Serial.println(humidity);
+
+  if (!client.connected()) {
+
+    return;
+  }
+
+  if (
+    !isnan(temperature) &&
+    !isnan(humidity)
+  ) {
+
+    char tempStr[16];
+    char humStr[16];
+
+    dtostrf(
+      temperature,
+      1,
+      2,
+      tempStr
+    );
+
+    dtostrf(
+      humidity,
+      1,
+      2,
+      humStr
+    );
+
+    client.publish(
+      TEMP_TOPIC,
+      tempStr
+    );
+
+    client.publish(
+      HUM_TOPIC,
+      humStr
+    );
+
+  } else {
+
+    client.publish(
+      TEMP_TOPIC,
+      "nan"
+    );
+
+    client.publish(
+      HUM_TOPIC,
+      "nan"
+    );
+  }
+}
+
+// =====================================================
+// OTA
+// =====================================================
+
+void setupOTA() {
+
+  ArduinoOTA.setHostname(
+    "Bathroom-ESP32"
+  );
+
+  ArduinoOTA.onStart([]() {
+
+    Serial.println(
+      "OTA start"
+    );
+  });
+
+  ArduinoOTA.onEnd([]() {
+
+    Serial.println(
+      "\nOTA finished"
+    );
+  });
+
+  ArduinoOTA.onProgress([](
+    unsigned int progress,
+    unsigned int total
+  ) {
+
+    Serial.printf(
+      "OTA: %u%%\r",
+      progress / (total / 100)
+    );
+  });
+
+  ArduinoOTA.onError([](
+    ota_error_t error
+  ) {
+
+    Serial.printf(
+      "OTA error [%u]\n",
+      error
+    );
+  });
+
+  ArduinoOTA.begin();
+
+  otaStarted = true;
+
+  Serial.println(
+    "OTA ready"
+  );
+}
+
+// =====================================================
+// MQTT CONNECT
+//
+// Может тормозить сколько угодно.
+// Это выполняется на ДРУГОМ ядре,
+// поэтому физические выключатели не тормозят.
+// =====================================================
+
+void connectMQTT() {
+
+  Serial.println(
+    "Trying MQTT..."
+  );
+
+  char clientId[40];
+
+  uint64_t chipid =
+    ESP.getEfuseMac();
+
+  snprintf(
+    clientId,
+    sizeof(clientId),
+    "BathroomESP-%04X%08X",
+    (uint16_t)(chipid >> 32),
+    (uint32_t)chipid
+  );
+
+  if (
+    client.connect(clientId)
+  ) {
+
+    Serial.println(
+      "MQTT connected"
+    );
+
+    client.subscribe(
+      LIGHT_TOPIC
+    );
+
+    client.subscribe(
+      VENTILATION_TOPIC
+    );
+
+    client.subscribe(
+      WARM_FLOOR_TOPIC
+    );
+
+    // После подключения отправим
+    // реальное состояние всего оборудования.
+
+    portENTER_CRITICAL(&stateMux);
+
+    lightStatusDirty = true;
+    ventStatusDirty = true;
+    floorStatusDirty = true;
+
+    portEXIT_CRITICAL(&stateMux);
+
+  } else {
+
+    Serial.print(
+      "MQTT unavailable. State: "
+    );
+
+    Serial.println(
+      client.state()
+    );
+  }
+}
+
+// =====================================================
+// NETWORK TASK
+//
+// Работает на CORE 0.
+//
+// Основной Arduino loop обычно работает на CORE 1.
+// =====================================================
+
+void networkTask(void* parameter) {
+
+  // ===================================================
+  // WIFI
+  // ===================================================
+
+  WiFi.mode(
+    WIFI_STA
+  );
+
+  WiFi.setAutoReconnect(
+    true
+  );
+
+  WiFi.begin(
+    ssid,
+    password
+  );
+
+  lastWiFiAttempt =
+    millis();
+
+  // ===================================================
+  // NETWORK LOOP
+  // ===================================================
+
+  while (true) {
+
+    unsigned long now =
+      millis();
+
+    // =================================================
+    // WIFI CONNECTED
+    // =================================================
+
+    if (
+      WiFi.status() ==
+      WL_CONNECTED
+    ) {
+
+      if (!wifiWasConnected) {
+
+        wifiWasConnected = true;
+
+        Serial.println();
+        Serial.println(
+          "WiFi connected"
+        );
+
+        Serial.print(
+          "IP: "
+        );
+
+        Serial.println(
+          WiFi.localIP()
+        );
+
+        lastMQTTAttempt = 0;
+      }
+
+      // ===============================================
+      // OTA
+      // ===============================================
+
+      if (!otaStarted) {
+
+        setupOTA();
+      }
+
+      ArduinoOTA.handle();
+
+      // ===============================================
+      // MQTT
+      // ===============================================
+
+      if (!client.connected()) {
+
+        if (
+          lastMQTTAttempt == 0 ||
+          now - lastMQTTAttempt >=
+          MQTT_RETRY_INTERVAL
+        ) {
+
+          lastMQTTAttempt =
+            now;
+
+          connectMQTT();
+        }
+
+      } else {
+
+        client.loop();
+
+        publishDirtyStates();
+
+        handleDHT();
+      }
+    }
+
+    // =================================================
+    // WIFI DISCONNECTED
+    // =================================================
+
+    else {
+
+      if (wifiWasConnected) {
+
+        wifiWasConnected = false;
+
+        Serial.println(
+          "WiFi disconnected"
+        );
+
+        client.disconnect();
+      }
+
+      if (
+        now - lastWiFiAttempt >=
+        WIFI_RETRY_INTERVAL
+      ) {
+
+        lastWiFiAttempt =
+          now;
+
+        Serial.println(
+          "Trying WiFi..."
+        );
+
+        WiFi.reconnect();
+      }
+    }
+
+    // Отдаём время другим задачам ядра 0
+    vTaskDelay(
+      pdMS_TO_TICKS(10)
+    );
+  }
+}
+
+// =====================================================
+// SETUP
+// =====================================================
+
+void setup() {
+
+  Serial.begin(
+    115200
+  );
+
+  // ===================================================
+  // OUTPUTS
+  // ===================================================
+
+  pinMode(
+    LED_INDICATOR,
+    OUTPUT
+  );
+
+  pinMode(
+    LIGHT_PIN,
+    OUTPUT
+  );
+
+  pinMode(
+    VENTILATION_PIN,
+    OUTPUT
+  );
+
+  pinMode(
+    WARM_FLOOR_PIN,
+    OUTPUT
+  );
+
+  // GPIO 34 / 35 не имеют внутреннего pull-up.
+  // Оставляем INPUT, как в текущей версии.
+  pinMode(
+    SWITCH_LIGHT,
+    INPUT
+  );
+
+  pinMode(
+    SWITCH_VENT,
+    INPUT
+  );
+
+  // ===================================================
+  // INITIAL STATE
+  // ===================================================
+
+  digitalWrite(
+    LIGHT_PIN,
+    HIGH
+  );
+
+  digitalWrite(
+    VENTILATION_PIN,
+    LOW
+  );
+
+  digitalWrite(
+    WARM_FLOOR_PIN,
+    LOW
+  );
+
+  // Читаем положение физических выключателей
+  rawLightSwitch =
+    digitalRead(SWITCH_LIGHT) == HIGH;
+
+  stableLightSwitch =
+    rawLightSwitch;
+
+  rawVentSwitch =
+    digitalRead(SWITCH_VENT) == HIGH;
+
+  stableVentSwitch =
+    rawVentSwitch;
+
+  // После включения питания ванная работает
+  // даже вообще без WiFi.
+  setLightState(
+    stableLightSwitch
+  );
+
+  setVentState(
+    stableVentSwitch
+  );
+
+  setFloorState(
+    false
+  );
+
+  // ===================================================
+  // DHT
+  // ===================================================
+
+  dht.begin();
+
+  // ===================================================
+  // MQTT CONFIG
+  // ===================================================
+
+  client.setServer(
+    mqtt_server,
+    mqtt_port
+  );
+
+  client.setCallback(
+    handleMQTTMessage
+  );
+
+  client.setSocketTimeout(
+    1
+  );
+
+  // ===================================================
+  // CREATE NETWORK TASK ON CORE 0
+  // ===================================================
+
+  xTaskCreatePinnedToCore(
+    networkTask,       // function
+    "networkTask",     // name
+    8192,              // stack
+    NULL,              // parameters
+    1,                 // priority
+    NULL,              // task handle
+    0                  // CORE 0
+  );
+
+  Serial.println();
+  Serial.println(
+    "Bathroom controller started"
+  );
+
+  Serial.println(
+    "Physical switches are LOCAL"
+  );
+}
+
+// =====================================================
+// MAIN LOOP
+//
+// Здесь больше НЕТ НИ ОДНОЙ сетевой операции.
+// =====================================================
+
+void loop() {
+
+  handleManualSwitches();
+
+  // 1 мс, чтобы не грузить ядро на 100%
+  delay(1);
+}
