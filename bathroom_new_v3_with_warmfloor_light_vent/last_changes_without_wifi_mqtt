@@ -8,7 +8,7 @@
 // =====================================================
 
 const char* ssid = "nov8-52-1";
-const char* password = "dfsDSvrdsw52";
+const char* password = "";
 
 const char* mqtt_server = "192.168.14.7";
 const uint16_t mqtt_port = 1883;
